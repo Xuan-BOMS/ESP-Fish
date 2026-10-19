@@ -2,4 +2,7 @@
 include/secrets_local.h
 gateway/.venv/
 gateway/__pycache__/
+.cache/
+outputs/
+*.env
 

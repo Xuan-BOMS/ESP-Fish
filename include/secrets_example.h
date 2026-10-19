@@ -4,4 +4,6 @@
 #define WIFI_PASSWORD "your-wifi-password"
 #define BALANCE_HOST "192.168.3.27"
 #define BALANCE_PORT 8081
+#define CONTROL_HOST BALANCE_HOST
+#define CONTROL_PORT 8082
 

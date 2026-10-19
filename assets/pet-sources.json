@@ -1,0 +1,42 @@
+{
+  "revision": "ddc63d9d8aa0701282e68cc6f3fdc26d5c81e793",
+  "size": 168,
+  "fps": 6,
+  "compression": "zlib",
+  "source_crop": [
+    111,
+    6,
+    470,
+    365
+  ],
+  "clips": [
+    {
+      "clip": "idle",
+      "source": "code/BigBlueFish.Windows/assets/fish/\u5f85\u673a\u547c\u5438\u4f11\u95f2.webm",
+      "sha256": "deb965d05a85dacf5ff4a20faa757846f0d11679598c3ec578a5571487660395",
+      "frames": 60,
+      "packed_bytes": 417173
+    },
+    {
+      "clip": "run",
+      "source": "code/BigBlueFish.Windows/assets/fish/\u539f\u5730\u5de6\u8f6c\u5954\u8dd1.webm",
+      "sha256": "79882aedd7b77caaacce1a34dece68e2f001a3dbfa5f9d049c1ce2fc04518d52",
+      "frames": 60,
+      "packed_bytes": 388728
+    },
+    {
+      "clip": "wave",
+      "source": "code/BigBlueFish.Windows/assets/fish/\u70b9\u51fb\u56de\u5e94-\u5143\u6c14\u6325\u624b.webm",
+      "sha256": "48cd729ccdcf746369942ea954d242e9afdd5643e1dac3827fa5e67450eb8776",
+      "frames": 60,
+      "packed_bytes": 425701
+    },
+    {
+      "clip": "bubble",
+      "source": "code/BigBlueFish.Windows/assets/fish/\u9cb8\u9c7c\u5410\u6ce1\u6ce1\u7279\u6548.webm",
+      "sha256": "d64d02059dc1602f7de5aa3135d381351363f021b2bceed47655db322cc71db3",
+      "frames": 60,
+      "packed_bytes": 446065
+    }
+  ]
+}

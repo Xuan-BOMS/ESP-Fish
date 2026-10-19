@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP Fish</title>
+<style>
+body{margin:0;background:#081429;color:#e1f4ff;font:16px system-ui,sans-serif}main{max-width:620px;margin:8vh auto;padding:24px}h1{font-size:36px;margin-bottom:8px}p{color:#9fb8ce;line-height:1.7}button{padding:16px 22px;background:#122c48;color:#e1f4ff;border:1px solid #477598;border-radius:12px;font:inherit;cursor:pointer;margin:6px 10px 6px 0}button[aria-pressed=true]{background:#72dcf5;color:#081429;border-color:#72dcf5}button:disabled{opacity:.5;cursor:wait}section{padding:20px 0;border-top:1px solid #25425e;margin-top:24px}label{display:block;margin:16px 0}#status{min-height:26px}small{color:#9fb8ce}pre{white-space:pre-wrap;font:14px system-ui;line-height:1.8}
+</style>
+<main>
+<small>桌面上的一条小鱼</small><h1>ESP Fish</h1>
+<p id="status" role="status">正在连接网关…</p>
+<div><button data-mode="balance" aria-pressed="false">余额与图像</button><button data-mode="pet" aria-pressed="false">自由桌宠</button></div>
+<p>桌宠会随机活动，倾斜时跟随移动。进入桌宠时以当前摆放姿态为参考；切回余额模式后，桌宠暂停。</p>
+<section><h2>倾斜方向</h2><p>保持设备静止，设置参考姿态；根据安装方向调整，让小鱼跟随实际倾斜方向。</p>
+<button id="calibrate">以当前姿态校准</button>
+<label><input type="checkbox" id="swap_axes"> 交换横向与纵向</label>
+<label><input type="checkbox" id="invert_x"> 反转横向</label>
+<label><input type="checkbox" id="invert_y"> 反转纵向</label></section>
+<section><h2>设备状态</h2><pre id="device">等待设备连接</pre></section>
+</main>
+<script>
+const statusEl=document.querySelector('#status'),buttons=[...document.querySelectorAll('[data-mode]')],axes=['swap_axes','invert_x','invert_y'];
+let busy=false;
+function render(s){
+ const d=s.device,confirmed=s.online&&d&&d.mode===s.mode;
+ statusEl.textContent=!s.online?'设备离线，已保存选择，连接后生效':confirmed?'设备在线 · 当前为'+(d.mode==='pet'?'桌宠模式':'余额模式'):'设备在线 · 正在切换…';
+ buttons.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.mode===s.mode)));
+ axes.forEach(k=>document.getElementById(k).checked=s[k]);
+ document.querySelector('#device').textContent=d?`倾斜传感器：${d.imu?'已连接':'未检测到（仍可随机活动）'}\n可用内存：${Math.round(d.heap/1024)} KB\n桌宠绘图内存：${Math.round(d.render_bytes/1024)} KB\n运行时间：${Math.round(d.uptime/1000)} 秒`:'等待设备连接';
+}
+async function request(path,body){const r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});const data=await r.json();if(!r.ok)throw Error(data.error||'请求失败');return data;}
+async function save(body,path='/api/mode'){busy=true;buttons.forEach(b=>b.disabled=true);try{render(await request(path,body));}catch(e){statusEl.textContent='保存失败：'+e.message;}finally{busy=false;buttons.forEach(b=>b.disabled=false);}}
+buttons.forEach(b=>b.onclick=()=>save({mode:b.dataset.mode}));
+document.getElementById('calibrate').onclick=()=>save({},'/api/calibrate');
+axes.forEach(k=>document.getElementById(k).onchange=e=>save({[k]:e.target.checked}));
+async function poll(){if(!busy)try{render(await request('/api/state'));}catch(e){statusEl.textContent='无法连接网关，稍后重试';}setTimeout(poll,1500);}poll();
+</script>
+</html>
