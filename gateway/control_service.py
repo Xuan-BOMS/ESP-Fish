@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """LAN-only mode gateway. The balance service and its API key remain separate."""
 import json
+import hashlib
 import math
 import os
 import threading
@@ -13,20 +14,60 @@ HOST = os.environ.get("CONTROL_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CONTROL_PORT", "8082"))
 STATE_FILE = Path(os.environ.get("CONTROL_STATE_FILE", str(Path.home() / ".local/state/espfish/control.json")))
 PAGE = Path(__file__).with_name("index.html")
+LIBRARY = Path(os.environ.get("CONTROL_LIBRARY", str(Path(__file__).with_name("library"))))
+CACHE_LIMIT = 1750000
+MAX_CLIPS = 16
 
 
 class State:
-    def __init__(self, path):
+    def __init__(self, path, library=LIBRARY):
         self.path = path
         self.lock = threading.Lock()
         self.config = {"mode": "balance", "swap_axes": False, "invert_x": False, "invert_y": False}
         self.device = None
         self.last_seen = 0.0
         self.calibration = 0
+        self.library = library
         try:
-            self.config.update(self.validate(json.loads(path.read_text(encoding="utf-8"))))
+            catalog = json.loads((library / "catalog.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            catalog = {"clips": [], "defaults": []}
+        self.clips = {clip["id"]: clip for clip in catalog["clips"]}
+        self.defaults = catalog["defaults"]
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            animations = saved.pop("animations", self.defaults)
+            self.config.update(self.validate(saved))
+            self.validate_playlist(animations)
+            self.config["animations"] = animations
         except (OSError, ValueError, TypeError):
             pass
+        self.config.setdefault("animations", self.defaults)
+
+    def validate_playlist(self, ids):
+        if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_CLIPS or any(not isinstance(i, str) for i in ids):
+            raise ValueError(f"Select 1..{MAX_CLIPS} animations")
+        if len(set(ids)) != len(ids) or any(i not in self.clips for i in ids):
+            raise ValueError("Unknown or duplicate animation")
+        if sum(self.clips[i]["bytes"] for i in ids) > CACHE_LIMIT:
+            raise ValueError("Selection exceeds ESP32 cache capacity")
+
+    def playlist(self):
+        clips = [{k: self.clips[i][k] for k in ("id", "role", "bytes", "sha256")}
+                 for i in self.config["animations"] if i in self.clips]
+        revision = hashlib.sha256(json.dumps(clips, sort_keys=True).encode()).hexdigest()[:16]
+        return {"revision": revision, "clips": clips}
+
+    def select(self, data):
+        if not isinstance(data, dict) or set(data) != {"animations"}:
+            raise ValueError("Expected animations")
+        self.validate_playlist(data["animations"])
+        self._save(data)
+
+    def catalog(self):
+        with self.lock:
+            return {"clips": list(self.clips.values()), "selected": self.config["animations"],
+                    "capacity": CACHE_LIMIT, "max_clips": MAX_CLIPS}
 
     @staticmethod
     def validate(data):
@@ -41,6 +82,9 @@ class State:
 
     def update(self, data):
         data = self.validate(data)
+        self._save(data)
+
+    def _save(self, data):
         with self.lock:
             config = self.config | data
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,10 +97,15 @@ class State:
         if not isinstance(data, dict) or data.get("mode") not in ("balance", "pet"):
             raise ValueError("Invalid device report")
         device = {"mode": data["mode"], "imu": data.get("imu") is True}
-        for key in ("heap", "x", "y", "ax", "ay", "render_bytes", "uptime", "frames"):
+        for key in ("heap", "x", "y", "ax", "ay", "render_bytes", "uptime", "frames", "cache_bytes", "cache_capacity", "downloaded", "download_total", "cached_clips"):
             value = data.get(key, 0)
             if type(value) not in (int, float) or not math.isfinite(value):
                 raise ValueError("Invalid telemetry")
+            device[key] = value
+        for key in ("library_revision", "sync_status", "sync_error"):
+            value = data.get(key, "")
+            if not isinstance(value, str) or len(value) > 160:
+                raise ValueError("Invalid cache status")
             device[key] = value
         with self.lock:
             self.device = device
@@ -68,7 +117,7 @@ class State:
 
     def snapshot(self):
         with self.lock:
-            return {**self.config, "calibration": self.calibration, "device": self.device,
+            return {**self.config, "playlist": self.playlist(), "calibration": self.calibration, "device": self.device,
                     "online": self.last_seen > 0 and time.monotonic() - self.last_seen < 20}
 
 
@@ -88,6 +137,31 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200, PAGE.read_bytes(), "text/html; charset=utf-8")
         elif self.path == "/api/state":
             self.reply(200, self.server.state.snapshot())
+        elif self.path == "/api/library":
+            self.reply(200, self.server.state.catalog())
+        elif self.path.startswith(("/assets/", "/media/", "/thumbs/")):
+            prefix, filename = self.path.strip("/").split("/", 1)
+            identifier, separator, extension = filename.partition(".")
+            expected = {"assets": ("pak", "application/octet-stream"), "media": ("webm", "video/webm"),
+                        "thumbs": ("jpg", "image/jpeg")}[prefix]
+            if not separator or extension != expected[0] or identifier not in self.server.state.clips:
+                self.reply(404, {"error": "Not found"})
+                return
+            path = self.server.state.library / filename
+            try:
+                with path.open("rb") as source:
+                    self.send_response(200)
+                    self.send_header("Content-Type", expected[1])
+                    self.send_header("Content-Length", str(path.stat().st_size))
+                    self.send_header("Cache-Control", "public, max-age=3600")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    while block := source.read(32768):
+                        self.wfile.write(block)
+            except FileNotFoundError:
+                self.reply(404, {"error": "Media unavailable"})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         else:
             self.reply(404, {"error": "Not found"})
 
@@ -108,6 +182,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.state.update(data)
             elif self.path == "/api/device":
                 self.server.state.report(data)
+            elif self.path == "/api/playlist":
+                self.server.state.select(data)
             elif self.path == "/api/calibrate" and data == {}:
                 self.server.state.calibrate()
             else:
@@ -125,10 +201,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-def make_server(address=(HOST, PORT), state_file=STATE_FILE):
+def make_server(address=(HOST, PORT), state_file=STATE_FILE, library=LIBRARY):
     server = ThreadingHTTPServer(address, Handler)
     server.daemon_threads = True
-    server.state = State(Path(state_file))
+    server.state = State(Path(state_file), Path(library))
     return server
 
 

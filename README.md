@@ -1,78 +1,106 @@
 # ESP Fish
 
-ESP32-C6 + ST7789 的余额显示与倾斜桌宠。香橙派提供余额代理和局域网模式切换网页。
+ESP32-C6 + ST7789 的余额显示与倾斜桌宠。香橙派保存完整动画库，网页选择后，设备只下载需要的动画。
 
 ## 使用
 
-打开 `http://<香橙派地址>:8082/`，选择“余额与图像”或“自由桌宠”。设备通常在 1–2 秒内接收选择；余额上游超时时最多额外等待约 10 秒。网页区分已保存的选择、设备实际模式和离线状态。
+打开 `http://<香橙派地址>:8082/`：
 
-- **余额模式**：保留角色图像、余额和已修复的右上角时钟；余额读取失败时保留最后结果并标记缓存。
-- **桌宠模式**：四段动画（待机、奔跑、挥手、吐泡泡），自主移动、随机活动、屏幕边界限制。倾斜优先于自主移动，传感器未连接时仍可自主活动。
-- **倾斜方向**：进入桌宠时自动将当前姿态设为中性方向，静置时随机活动，倾斜时跟随移动。摆放角度变化后，点击“以当前姿态校准”。网页支持交换横纵轴和分别反向，适配传感器安装方向；采用低通滤波和约 0.12g 死区。
-- **掉线与重启**：断网继续当前显示；设备保存最后成功进入的模式，网关保存模式和方向设置。重新连接后按网关配置同步。
+1. 在“动画水族馆”搜索、预览和勾选动画。底部显示所选容量，超出上限时不能发送。
+2. 点击“发送到 ESP32”，等待“已同步”。下载期间桌宠暂停，完成后自动恢复。切换余额模式仍可正常使用。
+3. 选择“自由桌宠”或“余额与图像”。桌宠随机活动，倾斜时跟随移动；传感器不可用时仍可自主活动。
+4. 改变摆放角度后，保持设备静止，点击“校准当前姿态”。横纵轴交换、反向设置适配不同安装方向。
 
-桌宠为原桌面项目的嵌入式动画适配，选取四段动作；桌面版的本地模型、OCR、MCP 等功能不包含在本项目中。
+香橙派目前保存 **106 段原动画（约 54 MB）** 和设备动画包（约 41 MB）。ESP32 缓存上限 **1,750,000 字节**，按每段大小通常可选约 4 段，短小动作可多选；数量最多 16 段，至少选择一段。默认待机、奔跑、挥手、吐泡泡合计 **1,679,747 字节**。也可只选择其他动作，缺少待机或奔跑时使用已选动画代替。
 
-## 硬件与内存
+断网后，已经下载的动画继续播放，重启也可直接读取本地缓存。网页保存模式、方向和动画选择，设备重新连上网关后自动同步。余额读取失败时保留上次结果并标记缓存；时钟末位越界已经修复。模式通常 1–2 秒内同步，余额上游超时可能额外延迟约 10 秒。
+
+桌面项目的本地模型、OCR、MCP 等功能不包含在此嵌入式适配中。
+
+## 存储与内存
+
+| 项目 | 实现 |
+| --- | --- |
+| 完整动画库 | 香橙派磁盘，预览时才加载视频 |
+| 所选动画 | ESP32 LittleFS Flash 缓存，下载后离线播放 |
+| 播放 RAM | 28,224 字节索引帧 + 10,992 字节解码器 + 336 字节 RGB565 行缓冲，共 **39,552 字节** |
+| 余额模式 | 释放全部桌宠绘图缓冲 |
+| 固件应用 | 约 **1.32 MB**，动画不再编译进程序 |
+| Flash 分区 | 4 MB `no_ota.csv`，2 MiB 应用 + 1,966,080 字节文件系统，无双分区 OTA |
+
+相较上一版 67,440 字节绘图缓冲，减少 **27,888 字节（约 41%）**。另外有固定调色板、文件句柄、Wi-Fi、JSON 和任务栈开销；后台网络任务使用 12 KB 栈。网页展示设备实际可用 RAM。少选动画主要减少 Flash 占用，播放缓冲大小不会随动画数量增加。
+
+从 640×360 原视频裁掉透明空白后直接缩小到 **168×168**，128 色、6 fps、逐帧 zlib 压缩，横纵各保留 72 像素移动范围。裁剪以统一参考框为下限，较大动作扩框以保留完整画面，避免从小图放大造成模糊。Flash 分块解压，移动时复用索引帧，逐行转换 RGB565 绘制，不分配全屏或双帧缓冲。
+
+更新时复用仍然选中的文件，删除不再选择的文件，下载到临时文件，经过大小、SHA-256、包头和索引校验后提交清单。下载失败会显示错误并自动重试。由于容量有限，替换过程中会先回收旧文件；中断后保留仍可校验的缓存子集，联网后补齐。不要在同步过程中断电；下载完成后可离线使用。
+
+## 硬件与构建
 
 | 硬件 | 连接 |
 | --- | --- |
-| ESP32-C6FH4 | 4 MB Flash，无需 PSRAM |
+| ESP32-C6FH4 | 4 MB Flash，无 PSRAM |
 | ST7789 240×240 | MOSI 6、SCLK 7、CS 14、DC 15、RST 21、BL 22 |
 | BMI160 | SDA 2、SCL 1，探测 0x69 / 0x68，仅启用加速度计 |
 
-静态图像和压缩动画均存放在 Flash。直接从原始 640×360 视频先裁去透明空白，再缩小为 **168×168**，避免先降至小图再放大造成细节丢失。全部动作使用共同裁剪框，避免尺寸跳变，横纵各保留 72 像素移动范围。240 帧动画采用 128 色、6 fps 和 zlib 压缩，压缩数据共 **1,677,667 字节**，另有调色板与帧索引；移动位置约每秒更新 30 次。
+1. 安装 PlatformIO，复制 `include/secrets_example.h` 为 `include/secrets_local.h`，填写 2.4 GHz Wi-Fi 与香橙派地址。私密配置已忽略。
+2. `python -m platformio run` 编译，`python -m platformio run -t upload` 烧录。默认 COM5，不同设备请修改 `platformio.ini`。
+3. 首次使用新分区会格式化动画缓存，保留地址相同的 NVS。请先保留完整 Flash 备份。静态图已提交，动画由网关下载。
 
-进入桌宠模式时分配一张 RGB565 帧缓冲和 ROM 解码器状态，共 **67,440 字节**，切回余额时全部释放。调色板索引先解压到帧缓冲的后半部分，再安全地原地展开为 RGB565，不额外分配索引整帧、全屏或双帧缓冲。解码器状态也放在堆中，避免占满任务栈；移动时复用已解码帧。后台网络任务使用独立的 8 KB 栈，网络等待不阻塞动画。
+重建香橙派动画库（主机需要 Python、Pillow、imageio-ffmpeg）：
 
-固件使用 4 MB Flash 的 `huge_app.csv` 分区布局，为清晰动画提供 3 MiB 应用分区；当前不支持双分区 OTA。NVS 起始地址与原布局一致，保留设备设置。运行时 Wi-Fi、JSON、任务栈和绘图缓冲额外使用堆内存，网页展示设备实测的可用内存。
+```sh
+python -m pip install Pillow imageio-ffmpeg
+python tools/prepare_library.py
+```
 
-## 构建与烧录
-
-1. 安装 PlatformIO，复制 `include/secrets_example.h` 为 `include/secrets_local.h`，填写 2.4 GHz Wi-Fi 与香橙派地址。私密配置已加入忽略规则。
-2. `python -m platformio run` 编译，`python -m platformio run -t upload` 烧录。默认 COM5，接入不同设备时修改 `platformio.ini`。
-3. 图像头文件已经提交，无需重新生成。需要重建时安装 Pillow、imageio-ffmpeg，再运行 `python tools/convert_whale.py`、`python tools/convert_pet.py`。动画来源固定到具体 Git 提交，清单记录源文件 SHA-256。
+固定上游提交见 `assets/library-sources.json`。生成的视频、缩略图、动画包和目录位于 `.cache/pet-library/`，不提交 Git。将该目录的内容复制到香橙派 `~/.local/share/espfish/library/`。每个 `.pak` 使用 `FISHPAK2` 包头、128 色 RGB565 调色板、帧偏移表和独立 zlib 帧。全部 106 包、6,329 帧已经过大小、哈希、偏移、解压和索引范围核验。
 
 ## 香橙派服务
 
 ### 余额代理（8081）
 
-`gateway/balance_service.py` 从 `DEEPSEEK_API_KEY` 环境变量读取密钥，查询 DeepSeek 余额并缓存最后成功结果。密钥只保存在香橙派受限环境文件中，不写入设备、仓库或命令参数。
+现有服务保持独立。`gateway/balance_service.py` 从 `DEEPSEEK_API_KEY` 环境变量读取密钥，查询并缓存余额。密钥只保存在香橙派受限环境文件中，不写入设备或仓库。
 
-新部署时，由管理员创建 `espfish` 服务用户，将脚本放入 `/opt/espfish/balance_service.py`，将环境文件放入 `/etc/espfish/balance.env`（root:espfish，640），再安装 `gateway/espfish-balance.service` 并启用。已有余额服务可以继续使用。
+新部署时创建 `espfish` 用户，将脚本放入 `/opt/espfish/balance_service.py`，将环境文件放入 `/etc/espfish/balance.env`（root:espfish，640），再安装 `gateway/espfish-balance.service` 并启用。
 
-### 模式网关（8082）
+### 动画与模式网关（8082）
 
-模式服务使用 Python 标准库，独立于余额代理，不需要 API 密钥。在香橙派以常用 SSH 用户执行：
+Python 标准库，无 API 密钥。在香橙派以常用 SSH 用户执行：
 
 ```sh
-mkdir -p ~/.local/share/espfish ~/.config/systemd/user
-# 将 gateway/control_service.py 与 gateway/index.html 复制到 ~/.local/share/espfish/
-# 将 gateway/espfish-control.service 复制到 ~/.config/systemd/user/
+mkdir -p ~/.local/share/espfish/library ~/.config/systemd/user
+# 复制 gateway/control_service.py 和 gateway/index.html 到 ~/.local/share/espfish/
+# 复制生成的动画库内容到 ~/.local/share/espfish/library/
+# 复制 gateway/espfish-control.service 到 ~/.config/systemd/user/
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
 systemctl --user enable --now espfish-control
 ```
 
-`enable-linger` 使服务在退出 SSH 和重启后继续运行；系统策略不同的设备可能需要管理员授权。配置默认写入 `~/.local/state/espfish/control.json`，可通过 `CONTROL_STATE_FILE` 覆盖。监听地址和端口支持 `CONTROL_HOST`、`CONTROL_PORT` 环境变量。两个服务均仅用于可信局域网。
+`enable-linger` 支持退出 SSH 与重启后运行；部分系统需管理员授权。配置默认存放在 `~/.local/state/espfish/control.json`。可用环境变量 `CONTROL_STATE_FILE`、`CONTROL_LIBRARY`、`CONTROL_HOST`、`CONTROL_PORT` 覆盖路径或监听地址。两个服务仅用于可信局域网。
 
 | 接口 | 用途 |
 | --- | --- |
-| `GET /` | 控制网页 |
-| `GET /api/state` | 模式、方向配置、设备在线和遥测 |
-| `POST /api/mode` | 设置 `mode: balance/pet` 或布尔方向配置 `swap_axes`、`invert_x`、`invert_y` |
-| `POST /api/device` | 设备上报当前模式与内存，获取期望配置 |
-| `POST /api/calibrate` | 发送 `{}`，以当前设备姿态重新校准倾斜零点 |
+| `GET /` | 动画选择与设备控制网页 |
+| `GET /api/library` | 动画目录、已选清单、容量上限 |
+| `GET /api/state` | 模式、播放清单、同步状态和设备遥测 |
+| `POST /api/playlist` | `{"animations":["动画 ID"]}`，校验容量后持久保存 |
+| `GET /assets/<id>.pak` | 所选设备动画包，按目录白名单提供 |
+| `GET /media/<id>.webm` | 原动画预览 |
+| `GET /thumbs/<id>.jpg` | 设备尺寸缩略图 |
+| `POST /api/mode` | `mode: balance/pet` 或布尔方向设置 |
+| `POST /api/device` | 上报状态，返回配置及紧凑下载清单 |
+| `POST /api/calibrate` | `{}`，重新校准当前姿态 |
 
 ## 验证与还原
 
-运行 `python -m unittest discover -s gateway -v` 检查余额响应、模式持久化、设备确认、无效参数及跨站请求。固件须经 PlatformIO 编译，并在实物上检查时钟、模式切换和实际倾斜方向。
+`python -m unittest discover -s gateway -v` 验证余额、配置持久化、容量拒绝、清单生成、文件白名单、跨站限制等。实机已检查默认四段下载、清理不再选择的动画、选择新动作、失败自动重试、单动画播放、十次模式切换及断开网关后重启缓存播放。
 
-改动前版本已标记为 **`baseline-display`**（提交 `2ba6a06`）。推荐在单独目录检出此标签，复制本机私密配置后重新编译烧录；不要在正在工作的目录直接覆盖未提交文件。也可使用本地保留的完整 Flash 备份恢复设备，备份含私密网络配置，不应公开。
+动画库改动前的清晰版为提交 **`aa1447c`**；原始余额显示为标签 **`baseline-display`**（`2ba6a06`）。在独立目录检出对应版本，复制本机私密配置，再编译烧录即可回退。分区随对应版本恢复；本地完整 Flash 备份也能恢复当时文件和设置，备份包含私密网络配置，请勿公开。
 
-停用新增网关：`systemctl --user disable --now espfish-control`。原有 8081 余额代理可继续运行；只有确定没有其他用户服务依赖时才考虑关闭 linger。
+停用网关：`systemctl --user disable --now espfish-control`。只有确定其他用户服务不依赖时才考虑关闭 linger。
 
 ## 素材许可
 
-- 静态角色图：来自 [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)，MIT；见 `assets/LICENSE-MeteorNOX`。
-- 四段桌宠动画：取自 [Bai-Cute/big-blue-fish-desktop-pet](https://github.com/Bai-Cute/big-blue-fish-desktop-pet)，原动画作者 [PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet)，MIT；见 `assets/LICENSE-PC2005-cloud` 与 `assets/pet-sources.json`。动画经过缩小、降帧、调色板量化和压缩。
+- 静态图来自 [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)，MIT，见 `assets/LICENSE-MeteorNOX`。
+- 动画取自 [Bai-Cute/big-blue-fish-desktop-pet](https://github.com/Bai-Cute/big-blue-fish-desktop-pet)，原作者 [PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet)，MIT，见 `assets/LICENSE-PC2005-cloud`。完整来源、源文件及转换后 SHA-256 见 `assets/library-sources.json`。仅适配动画素材，未复制桌面项目代码。

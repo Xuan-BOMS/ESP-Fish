@@ -5,4 +5,5 @@ gateway/__pycache__/
 .cache/
 outputs/
 *.env
+__pycache__/
 

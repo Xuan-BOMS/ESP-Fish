@@ -12,7 +12,7 @@
 
 #include "secrets_local.h"
 #include "whale_bitmap.h"
-#include "pet_frames.h"
+#include "pet_cache.h"
 
 #ifndef CONTROL_HOST
 #define CONTROL_HOST BALANCE_HOST
@@ -27,8 +27,8 @@ constexpr uint16_t panel = 0x10E8;
 constexpr uint32_t balanceIntervalMs = 60000;
 constexpr int petDisplaySize = petSize;
 constexpr int petTravel = screenSize - petDisplaySize;
-constexpr size_t petPixelBytes = petSize * petSize * sizeof(uint16_t);
-constexpr size_t petBufferBytes = petPixelBytes + sizeof(tinfl_decompressor);
+constexpr size_t petPixelBytes = petSize * petSize;
+constexpr size_t petBufferBytes = petPixelBytes + sizeof(tinfl_decompressor) + petSize * sizeof(uint16_t);
 static_assert(petSize < screenSize, "Pet must leave room for movement");
 Arduino_HWSPI displayBus(15, 14, 7, 6, -1);
 Arduino_ST7789 display(&displayBus, 21, 0, true, screenSize, screenSize, 0, 0);
@@ -66,14 +66,17 @@ State snapshot() {
 bool displayReady = false;
 String lastShownTime;
 int lastShownState = -1;
-uint16_t *petBuffer = nullptr;
+uint8_t *petBuffer = nullptr;
+uint16_t *petRow = nullptr;
+uint16_t petPalette[128];
+uint32_t loadedGeneration = 0;
 tinfl_decompressor *petInflater = nullptr;
 uint8_t imuAddress = 0;
 uint8_t imuErrors = 0;
 struct Vector { float x, y, z; } gravity{}, horizontal{1, 0, 0}, vertical{0, 1, 0};
 float tiltX = 0, tiltY = 0;
 bool facingRight = false;
-bool petFrameValid = false, decodedMirror = false;
+bool petFrameValid = false;
 uint8_t decodedClip = 0;
 uint16_t decodedFrame = 0;
 float petX = petTravel / 2, petY = petTravel / 2;
@@ -223,45 +226,43 @@ void setClip(uint8_t index) {
 }
 
 bool decodeFrame() {
-  const PetClip &clip = petClips[clipIndex];
-  uint32_t offset = pgm_read_dword(clip.offsets + frameIndex);
-  uint32_t end = pgm_read_dword(clip.offsets + frameIndex + 1);
-  constexpr size_t pixels = petSize * petSize;
-  uint8_t *indices = reinterpret_cast<uint8_t *>(petBuffer) + pixels;
-  size_t inputSize = end - offset, outputSize = pixels;
+  File file;
+  uint32_t remaining;
+  if (!petCache.open(clipIndex, frameIndex, file, petPalette, remaining)) return false;
+  uint8_t input[1024];
+  size_t produced = 0;
   tinfl_init(petInflater);
-  tinfl_status status = tinfl_decompress(petInflater, clip.data + offset, &inputSize,
-                                       indices, indices, &outputSize,
-                                       TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
-  if (status != TINFL_STATUS_DONE || outputSize != pixels || inputSize != end - offset) return false;
-  // Expanding forward preserves unread indices in the upper half of this buffer.
-  for (size_t i = 0; i < pixels; ++i) {
-    uint8_t color = indices[i];
-    if (color >= 128) return false;
-    petBuffer[i] = pgm_read_word(clip.palette + color);
+  while (remaining) {
+    size_t chunk = min(size_t(remaining), sizeof(input));
+    if (file.read(input, chunk) != chunk) return false;
+    remaining -= chunk;
+    size_t consumed = 0;
+    while (consumed < chunk) {
+      size_t inBytes = chunk - consumed, outBytes = petPixelBytes - produced;
+      uint32_t flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+      if (remaining) flags |= TINFL_FLAG_HAS_MORE_INPUT;
+      tinfl_status result = tinfl_decompress(petInflater, input + consumed, &inBytes,
+                                            petBuffer, petBuffer + produced, &outBytes, flags);
+      consumed += inBytes;
+      produced += outBytes;
+      if (result == TINFL_STATUS_DONE) {
+        if (remaining || consumed != chunk || produced != petPixelBytes) return false;
+        for (size_t i = 0; i < petPixelBytes; ++i) if (petBuffer[i] >= 128) return false;
+        return true;
+      }
+      if (result < 0 || result == TINFL_STATUS_HAS_MORE_OUTPUT || (!inBytes && !outBytes)) return false;
+    }
   }
-  return true;
+  return false;
 }
 
 void renderPet(int x, int y) {
-  if (!displayReady) return;
-  bool mirror = clipIndex == 1 && facingRight;
-  if (!petFrameValid || decodedClip != clipIndex || decodedFrame != frameIndex || decodedMirror != mirror) {
+  if (!displayReady || !petCache.count) return;
+  bool mirror = petCache.clips[clipIndex].role == 1 && facingRight;
+  if (!petFrameValid || decodedClip != clipIndex || decodedFrame != frameIndex) {
     if (!decodeFrame()) { petFrameValid = false; return; }
-    if (mirror) {
-      for (int row = 0; row < petSize; ++row) {
-        for (int col = 0; col < petSize / 2; ++col) {
-          uint16_t &left = petBuffer[row * petSize + col];
-          uint16_t &right = petBuffer[row * petSize + petSize - 1 - col];
-          uint16_t pixel = left;
-          left = right;
-          right = pixel;
-        }
-      }
-    }
     decodedClip = clipIndex;
     decodedFrame = frameIndex;
-    decodedMirror = mirror;
     petFrameValid = true;
   }
   if (oldPetX >= 0) {
@@ -270,14 +271,30 @@ void renderPet(int x, int y) {
     if (y > oldPetY) display.fillRect(oldPetX, oldPetY, petDisplaySize, y - oldPetY, background);
     if (y < oldPetY) display.fillRect(oldPetX, y + petDisplaySize, petDisplaySize, oldPetY - y, background);
   }
-  display.draw16bitRGBBitmap(x, y, petBuffer, petSize, petSize);
+  for (int row = 0; row < petSize; ++row) {
+    for (int col = 0; col < petSize; ++col)
+      petRow[col] = petPalette[petBuffer[row * petSize + (mirror ? petSize - col - 1 : col)]];
+    display.draw16bitRGBBitmap(x, y + row, petRow, petSize, 1);
+  }
   ++renderedFrames;
   oldPetX = x;
   oldPetY = y;
 }
 
+uint8_t roleClip(uint8_t role) {
+  for (int i = 0; i < petCache.count; ++i) if (petCache.clips[i].role == role) return i;
+  return 0;
+}
+
 void updatePet(uint32_t now) {
-  if (!petBuffer || now - lastMotion < 33) return;
+  if (!petBuffer || !petCache.count || now - lastMotion < 33) return;
+  if (loadedGeneration != petCache.generation) {
+    loadedGeneration = petCache.generation;
+    petFrameValid = false;
+    setClip(roleClip(0));
+    drawScene();
+  }
+  uint32_t petFrameMs = 1000 / petCache.clips[clipIndex].fps;
   float dt = fminf((now - lastMotion) / 1000.0f, 0.1f);
   lastMotion = now;
   if (!imuAddress && now - lastImuRetry >= 5000) {
@@ -297,8 +314,8 @@ void updatePet(uint32_t now) {
     if (random(3) == 0) {
       wanderX = wanderY = 0;
       if (!tilted) {
-        setClip(random(3) == 0 ? 0 : random(2, 4));
-        nextWander = now + petClips[clipIndex].frames * petFrameMs;
+        setClip(random(petCache.count));
+        nextWander = now + petCache.clips[clipIndex].frames * petFrameMs;
       }
     }
   }
@@ -306,8 +323,8 @@ void updatePet(uint32_t now) {
   float vy = tilted ? (fabsf(ay) > 0.12f ? ay * 85 : 0) : wanderY;
   bool moving = fabsf(vx) + fabsf(vy) > 1;
   if (fabsf(vx) > 1) facingRight = vx > 0;
-  if (moving && clipIndex != 1) setClip(1);
-  if (!moving && clipIndex == 1) setClip(0);
+  if (moving && clipIndex != roleClip(1)) setClip(roleClip(1));
+  if (!moving && petCache.clips[clipIndex].role == 1) setClip(roleClip(0));
   petX = constrain(petX + vx * dt, 0.0f, float(petTravel));
   petY = constrain(petY + vy * dt, 0.0f, float(petTravel));
   if (petX <= 0 || petX >= petTravel) wanderX = -wanderX;
@@ -315,13 +332,13 @@ void updatePet(uint32_t now) {
   if (now - lastFrame >= petFrameMs) {
     lastFrame = now;
     renderPet(lroundf(petX), lroundf(petY));
-    if (++frameIndex >= petClips[clipIndex].frames) {
+    if (++frameIndex >= petCache.clips[clipIndex].frames) {
       frameIndex = 0;
-      if (!moving) setClip(random(3) == 0 ? random(2, 4) : 0);
+      if (!moving) setClip(random(3) == 0 ? random(petCache.count) : roleClip(0));
     }
   } else if (oldPetX != lroundf(petX) || oldPetY != lroundf(petY)) {
     uint16_t nextFrame = frameIndex;
-    frameIndex = frameIndex ? frameIndex - 1 : petClips[clipIndex].frames - 1;
+    frameIndex = frameIndex ? frameIndex - 1 : petCache.clips[clipIndex].frames - 1;
     renderPet(lroundf(petX), lroundf(petY));
     frameIndex = nextFrame;
   }
@@ -330,12 +347,13 @@ void updatePet(uint32_t now) {
 void changeMode(Mode desired) {
   petFrameValid = false;
   if (desired == Mode::Pet) {
-    petBuffer = static_cast<uint16_t *>(heap_caps_malloc(petBufferBytes, MALLOC_CAP_8BIT));
+    petBuffer = static_cast<uint8_t *>(heap_caps_malloc(petBufferBytes, MALLOC_CAP_8BIT));
     if (!petBuffer) {
       Serial.println("[mode] insufficient contiguous memory; keeping balance mode");
       return;
     }
     petInflater = reinterpret_cast<tinfl_decompressor *>(reinterpret_cast<uint8_t *>(petBuffer) + petPixelBytes);
+    petRow = reinterpret_cast<uint16_t *>(reinterpret_cast<uint8_t *>(petInflater) + sizeof(tinfl_decompressor));
     initImu();
     lastImuRetry = millis();
     petX = petY = petTravel / 2;
@@ -347,6 +365,7 @@ void changeMode(Mode desired) {
     free(petBuffer);
     petBuffer = nullptr;
     petInflater = nullptr;
+    petRow = nullptr;
   }
   shown.active = desired;
   preferences.putBool("pet", desired == Mode::Pet);
@@ -388,7 +407,7 @@ bool fetchBalance() {
   return true;
 }
 
-void syncControl() {
+void syncControl(bool updateCache = true) {
   State current = snapshot();
   JsonDocument report;
   report["mode"] = current.active == Mode::Pet ? "pet" : "balance";
@@ -401,6 +420,7 @@ void syncControl() {
   report["ax"] = current.ax;
   report["ay"] = current.ay;
   report["uptime"] = millis();
+  petCache.telemetry(report);
   String body;
   serializeJson(report, body);
   HTTPClient http;
@@ -411,7 +431,9 @@ void syncControl() {
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   JsonDocument response;
-  if (code == HTTP_CODE_OK && !deserializeJson(response, http.getString())) {
+  bool valid = code == HTTP_CODE_OK && !deserializeJson(response, http.getString());
+  http.end();
+  if (valid) {
     String mode = response["mode"] | "";
     if (mode == "balance" || mode == "pet") {
       portENTER_CRITICAL(&stateLock);
@@ -422,8 +444,11 @@ void syncControl() {
       shared.calibration = response["calibration"] | 0U;
       portEXIT_CRITICAL(&stateLock);
     }
+    if (updateCache) {
+      String base = String("http://") + CONTROL_HOST + ":" + CONTROL_PORT;
+      petCache.sync(response["playlist"].as<JsonObjectConst>(), base, [] { syncControl(false); });
+    }
   }
-  http.end();
 }
 
 void networkTask(void *) {
@@ -467,12 +492,13 @@ void setup() {
   Wire.setTimeOut(20);
   preferences.begin("espfish", false);
   shared.desired = preferences.getBool("pet", false) ? Mode::Pet : Mode::Balance;
+  petCache.begin();
   randomSeed(esp_random());
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   configTime(8 * 3600, 0, "pool.ntp.org", "time.cloudflare.com");
-  if (xTaskCreate(networkTask, "gateway", 8192, nullptr, 1, nullptr) != pdPASS) {
+  if (xTaskCreate(networkTask, "gateway", 12288, nullptr, 1, nullptr) != pdPASS) {
     Serial.println("[network] worker allocation failed");
   }
   Serial.println("[boot] ESP Fish dual-mode display");
@@ -495,7 +521,10 @@ void loop() {
       calibrateTilt();
       lastCalibration = current.calibration;
     }
-    updatePet(now);
+    if (petCache.mutex && xSemaphoreTake(petCache.mutex, 0) == pdTRUE) {
+      updatePet(now);
+      xSemaphoreGive(petCache.mutex);
+    }
   }
   else if (balanceChanged) drawBalance();
   if (now - lastStatus >= 1000) { lastStatus = now; updateStatus(); }
