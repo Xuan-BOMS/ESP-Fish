@@ -1,0 +1,5 @@
+.pio/
+include/secrets_local.h
+gateway/.venv/
+gateway/__pycache__/
+

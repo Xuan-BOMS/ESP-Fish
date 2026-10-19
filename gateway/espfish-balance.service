@@ -1,0 +1,19 @@
+[Unit]
+Description=ESP Fish DeepSeek balance display service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=espfish
+EnvironmentFile=/etc/espfish/balance.env
+ExecStart=/usr/bin/python3 /opt/espfish/balance_service.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
